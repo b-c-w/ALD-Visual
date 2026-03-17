@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Particle Simulation</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #1a1a1a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: monospace;
+    color: #ccc;
+    gap: 16px;
+    padding: 16px;
+  }
+  canvas {
+    display: block;
+    box-shadow: 0 0 20px rgba(0,0,0,0.5);
+  }
+  .controls {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 24px;
+    background: #222;
+    border: 1px solid #333;
+    padding: 14px 18px;
+    border-radius: 6px;
+    width: 384px;
+  }
+  .control-row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  label { font-size: 11px; color: #aaa; }
+  input[type=number] {
+    background: #111;
+    border: 1px solid #444;
+    color: #eee;
+    padding: 4px 6px;
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 13px;
+    width: 100%;
+  }
+  input[type=number]:focus { outline: 1px solid #556; }
+  .hint { font-size: 10px; color: #666; }
+  button {
+    grid-column: 1 / -1;
+    background: #334;
+    border: 1px solid #556;
+    color: #cce;
+    font-family: monospace;
+    font-size: 13px;
+    padding: 6px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  button:hover { background: #445; }
+</style>
+</head>
+<body>
+<canvas id="sim"></canvas>
+<div class="controls">
+  <div class="control-row">
+    <label>Max speed (px/s)</label>
+    <input type="number" id="maxSpeed" value="768" min="50" max="2000" step="10"/>
+    <span class="hint">4" width in 0.5s ≈ 768</span>
+  </div>
+  <div class="control-row">
+    <label>Min speed (px/s)</label>
+    <input type="number" id="minSpeed" value="400" min="10" max="1000" step="10"/>
+    <span class="hint">4" width in 4s ≈ 96</span>
+  </div>
+  <div class="control-row">
+    <label>Entry zone top (%)</label>
+    <input type="number" id="entryTop" value="5" min="0" max="100" step="1"/>
+    <span class="hint">% down from top</span>
+  </div>
+  <div class="control-row">
+    <label>Entry zone bottom (%)</label>
+    <input type="number" id="entryBottom" value="20" min="0" max="100" step="1"/>
+    <span class="hint">% down from top</span>
+  </div>
+  <div class="control-row">
+    <label>Entry angle range (°)</label>
+    <input type="number" id="entryAngle" value="45" min="0" max="89" step="1"/>
+    <span class="hint">± degrees from horizontal</span>
+  </div>
+  <div class="control-row">
+    <label>Balls per step</label>
+    <input type="number" id="ballCount" value="150" min="1" max="300" step="1"/>
+  </div>
+  <div class="control-row">
+    <label>Stick probability (%)</label>
+    <input type="number" id="stickProb" value="100" min="0" max="100" step="1"/>
+  </div>
+  <div class="control-row">
+    <label>Entry duration (s)</label>
+    <input type="number" id="entryDuration" value="0.5" min="0.1" max="10" step="0.1"/>
+    <span class="hint">time for all balls to enter</span>
+  </div>
+  <div class="control-row" style="grid-column: 1 / -1;">
+    <button id="restartBtn">↺ Restart</button>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('sim');
+const ctx = canvas.getContext('2d');
+
+const DPI = 96;
+const W = 4 * DPI;
+const H = 3 * DPI;
+canvas.width = W;
+canvas.height = H;
+
+const BALL_R = W / 60;
+const DIAMETER = BALL_R * 2;
+const OVERLAP_STICK = 2;
+const SUBSTEPS = 3;
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+
+function getParams() {
+  return {
+    maxSpeed:      parseFloat(document.getElementById('maxSpeed').value)      || 768,
+    minSpeed:      parseFloat(document.getElementById('minSpeed').value)      || 400,
+    entryTop:      parseFloat(document.getElementById('entryTop').value)      / 100,
+    entryBottom:   parseFloat(document.getElementById('entryBottom').value)   / 100,
+    entryAngle:    parseFloat(document.getElementById('entryAngle').value)    || 45,
+    ballCount:     parseInt(document.getElementById('ballCount').value)       || 150,
+    stickProb:     parseFloat(document.getElementById('stickProb').value)     / 100,
+    entryDuration: parseFloat(document.getElementById('entryDuration').value) * 1000 || 500,
+  };
+}
+
+// --- Sim state ---
+let simState;
+let lastTime = null;
+
+function createBaseLayer() {
+  const layer = [];
+  const count = 30;
+  const spacing = W / count;
+  for (let i = 0; i < count; i++) {
+    layer.push({
+      x: spacing * (i + 0.5),
+      y: H - BALL_R,
+      r: BALL_R,
+      color: '#004488',
+      immobile: true,
+      id: Math.random()
+    });
+  }
+  return layer;
+}
+
+function resetSim() {
+  simState = {
+    status: 'idle',
+    idleTimer: 0,
+    phase: 0,
+    movingBalls: [],
+    immobilizedLayers: [],
+    baseLayer: createBaseLayer(),
+    exitOpen: false,
+    phaseTimer: 0,
+    allBallsEntered: false,
+    entrySchedule: [],
+    entryIndex: 0,
+    floorY: H - BALL_R * 2,  // hard floor: top of base layer
+  };
+}
+
+function getFloorY(s) {
+  // The hard floor is the average Y of the top surface of the most recent immobile layer
+  // minus one diameter (so balls can't sink below the top of that layer)
+  const topLayer = s.immobilizedLayers.length > 0
+    ? s.immobilizedLayers[s.immobilizedLayers.length - 1]
+    : s.baseLayer;
+  const avgY = topLayer.reduce((sum, b) => sum + b.y, 0) / topLayer.length;
+  return avgY - BALL_R;
+}
+
+function getAllImmobile(s) {
+  let arr = [...s.baseLayer];
+  for (const layer of s.immobilizedLayers) arr = arr.concat(layer);
+  // Also include newly stuck balls from current phase
+  arr = arr.concat(s.movingBalls.filter(b => b.immobile));
+  return arr;
+}
+
+function scheduleEntries(params, phase) {
+  const color = phase === 0 ? '#BB5566' : '#004488';
+  const schedule = [];
+  for (let i = 0; i < params.ballCount; i++) {
+    const t = rand(0, params.entryDuration);
+    const y = H * rand(params.entryTop, params.entryBottom);
+    const angleDeg = rand(-params.entryAngle, params.entryAngle);
+    const angleRad = angleDeg * Math.PI / 180;
+    const speed = rand(params.minSpeed, params.maxSpeed);
+    schedule.push({
+      t, y,
+      vx: speed * Math.cos(angleRad),
+      vy: -speed * Math.sin(angleRad),
+      color
+    });
+  }
+  schedule.sort((a, b) => a.t - b.t);
+  return schedule;
+}
+
+function startPhase() {
+  const params = getParams();
+  simState.movingBalls = [];
+  simState.exitOpen = false;
+  simState.phaseTimer = 0;
+  simState.allBallsEntered = false;
+  simState.entrySchedule = scheduleEntries(params, simState.phase);
+  simState.entryIndex = 0;
+  simState.floorY = getFloorY(simState);
+  simState.status = 'running';
+}
+
+// --- Velocity helpers ---
+function enforceMinSpeed(ball, minSpeed) {
+  const spd = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+  if (spd < minSpeed && spd > 0) {
+    const scale = minSpeed / spd;
+    ball.vx *= scale;
+    ball.vy *= scale;
+  } else if (spd === 0) {
+    ball.vx = minSpeed;
+    ball.vy = 0;
+  }
+}
+
+function biasTowardRight(ball, minSpeed) {
+  const spd = Math.max(Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy), minSpeed);
+  ball.vx = Math.abs(ball.vx) < 0.01 ? spd * 0.3 : Math.abs(ball.vx);
+  const len = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+  ball.vx = (ball.vx / len) * spd;
+  ball.vy = (ball.vy / len) * spd;
+}
+
+// --- Collision: moving vs immobile ---
+function reflectOffImmobile(ball, imm, exitOpen, minSpeed) {
+  const dx = ball.x - imm.x;
+  const dy = ball.y - imm.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist === 0) return;
+  const nx = dx / dist;
+  const ny = dy / dist;
+  const dot = ball.vx * nx + ball.vy * ny;
+  if (dot >= 0) return; // already separating
+  ball.vx -= 2 * dot * nx;
+  ball.vy -= 2 * dot * ny;
+  const overlap = (ball.r + imm.r) - dist;
+  if (overlap > 0) { ball.x += nx * overlap; ball.y += ny * overlap; }
+  if (exitOpen) biasTowardRight(ball, minSpeed);
+  else enforceMinSpeed(ball, minSpeed);
+}
+
+// --- Collision: moving vs moving ---
+function resolveMovingCollision(a, b, exitOpen, minSpeed) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const minDist = a.r + b.r;
+  if (dist >= minDist || dist === 0) return;
+  const nx = dx / dist;
+  const ny = dy / dist;
+  const overlap = (minDist - dist) / 2;
+  a.x -= nx * overlap; a.y -= ny * overlap;
+  b.x += nx * overlap; b.y += ny * overlap;
+  const dvx = a.vx - b.vx;
+  const dvy = a.vy - b.vy;
+  const dot = dvx * nx + dvy * ny;
+  if (dot <= 0) return;
+  a.vx -= dot * nx; a.vy -= dot * ny;
+  b.vx += dot * nx; b.vy += dot * ny;
+  if (exitOpen) {
+    biasTowardRight(a, minSpeed);
+    biasTowardRight(b, minSpeed);
+  } else {
+    enforceMinSpeed(a, minSpeed);
+    enforceMinSpeed(b, minSpeed);
+  }
+}
+
+// --- Wall bounce ---
+function wallBounce(ball, exitOpen, minSpeed, floorY) {
+  let bounced = false;
+  if (ball.y - ball.r < 0) {
+    ball.y = ball.r; ball.vy = Math.abs(ball.vy); bounced = true;
+  }
+  // Hard floor: can't go below top surface of prior layer
+  if (ball.y > floorY) {
+    ball.y = floorY; ball.vy = -Math.abs(ball.vy); bounced = true;
+  }
+  if (ball.x - ball.r < 0) {
+    ball.x = ball.r; ball.vx = Math.abs(ball.vx); bounced = true;
+  }
+  if (!exitOpen && ball.x + ball.r > W) {
+    ball.x = W - ball.r; ball.vx = -Math.abs(ball.vx); bounced = true;
+  }
+  if (bounced) {
+    if (exitOpen) biasTowardRight(ball, minSpeed);
+    else enforceMinSpeed(ball, minSpeed);
+  }
+}
+
+// --- Stick position check ---
+// Returns true if the proposed stick position is clear of all existing immobile balls
+function stickPositionClear(px, py, allImmobile, excludeId) {
+  for (const imm of allImmobile) {
+    if (imm.id === excludeId) continue;
+    const dx = px - imm.x;
+    const dy = py - imm.y;
+    const distSq = dx*dx + dy*dy;
+    // Require center-to-center distance >= 2*r - OVERLAP_STICK to prevent overlap
+    const minDist = DIAMETER - OVERLAP_STICK;
+    if (distSq < minDist * minDist) return false;
+  }
+  return true;
+}
+
+// --- Layer coverage check ---
+function isTopSurfaceCovered(s) {
+  const newlyImmobile = s.movingBalls.filter(b => b.immobile);
+  if (newlyImmobile.length === 0) return false;
+  const topSurface = s.immobilizedLayers.length === 0
+    ? s.baseLayer
+    : s.immobilizedLayers[s.immobilizedLayers.length - 1];
+  if (topSurface.length === 0) return false;
+  const minX = Math.min(...topSurface.map(b => b.x)) - BALL_R;
+  const maxX = Math.max(...topSurface.map(b => b.x)) + BALL_R;
+  const sorted = [...newlyImmobile].sort((a, b) => a.x - b.x);
+  if (sorted[0].x - BALL_R > minX + DIAMETER * 1.05) return false;
+  if (sorted[sorted.length-1].x + BALL_R < maxX - DIAMETER * 1.05) return false;
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = sorted[i].x - BALL_R - (sorted[i-1].x + BALL_R);
+    if (gap > DIAMETER * 1.05) return false;
+  }
+  return true;
+}
+
+// --- Update ---
+function update(dt) {
+  const s = simState;
+  const params = getParams();
+
+  if (s.status === 'idle') {
+    s.idleTimer += dt;
+    if (s.idleTimer >= 1500) { s.idleTimer = 0; startPhase(); }
+    return;
+  }
+  if (s.status === 'done') return;
+
+  s.phaseTimer += dt;
+
+  // Spawn balls
+  if (!s.allBallsEntered) {
+    while (s.entryIndex < s.entrySchedule.length &&
+           s.phaseTimer >= s.entrySchedule[s.entryIndex].t) {
+      const e = s.entrySchedule[s.entryIndex++];
+      s.movingBalls.push({
+        x: -BALL_R, y: e.y,
+        r: BALL_R,
+        vx: Math.abs(e.vx),
+        vy: e.vy,
+        color: e.color,
+        immobile: false,
+        id: Math.random(),
+        contactedIds: new Set()
+      });
+    }
+    if (s.entryIndex >= s.entrySchedule.length) s.allBallsEntered = true;
+  }
+
+  const oppositeColor = s.phase === 0 ? '#004488' : '#BB5566';
+  const subDt = dt / SUBSTEPS;
+
+  for (let step = 0; step < SUBSTEPS; step++) {
+    const allImmobile = getAllImmobile(s);
+    const moving = s.movingBalls.filter(b => !b.immobile);
+
+    // Move
+    const subDtSec = subDt / 1000;
+    for (const ball of moving) {
+      ball.x += ball.vx * subDtSec;
+      ball.y += ball.vy * subDtSec;
+      wallBounce(ball, s.exitOpen, params.minSpeed, s.floorY);
+    }
+
+    // Remove exited
+    if (s.exitOpen) {
+      for (let i = s.movingBalls.length - 1; i >= 0; i--) {
+        if (!s.movingBalls[i].immobile && s.movingBalls[i].x - BALL_R > W) {
+          s.movingBalls.splice(i, 1);
+        }
+      }
+    }
+
+    // Moving vs immobile
+    const movingNow = s.movingBalls.filter(b => !b.immobile);
+    for (const ball of movingNow) {
+      for (const imm of allImmobile) {
+        const dx = ball.x - imm.x;
+        const dy = ball.y - imm.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        const minDist = ball.r + imm.r;
+
+        if (dist < minDist) {
+          const key = imm.id;
+          if (!ball.contactedIds.has(key)) {
+            ball.contactedIds.add(key);
+
+            // Attempt to stick?
+            const canStick = imm.color === oppositeColor && !s.exitOpen;
+            if (canStick && Math.random() < params.stickProb) {
+              // Compute proposed stick position
+              const nx = dist > 0 ? dx/dist : 1;
+              const ny = dist > 0 ? dy/dist : 0;
+              const px = imm.x + nx * (minDist - OVERLAP_STICK);
+              const py = imm.y + ny * (minDist - OVERLAP_STICK);
+
+              // Only stick if position is clear
+              if (stickPositionClear(px, py, allImmobile, ball.id)) {
+                ball.immobile = true;
+                ball.vx = 0; ball.vy = 0;
+                ball.x = px; ball.y = py;
+              } else {
+                // Position occupied — bounce instead
+                reflectOffImmobile(ball, imm, s.exitOpen, params.minSpeed);
+              }
+            } else {
+              reflectOffImmobile(ball, imm, s.exitOpen, params.minSpeed);
+            }
+          } else {
+            // Re-contact: push out
+            if (dist > 0) {
+              const nx = dx/dist;
+              const ny = dy/dist;
+              ball.x += nx * (minDist - dist);
+              ball.y += ny * (minDist - dist);
+              const dot = ball.vx*nx + ball.vy*ny;
+              if (dot < 0) { ball.vx -= 2*dot*nx; ball.vy -= 2*dot*ny; }
+            }
+            if (s.exitOpen) biasTowardRight(ball, params.minSpeed);
+            else enforceMinSpeed(ball, params.minSpeed);
+          }
+        } else {
+          ball.contactedIds.delete(imm.id);
+        }
+      }
+    }
+
+    // Moving vs moving
+    const movingFinal = s.movingBalls.filter(b => !b.immobile);
+    for (let i = 0; i < movingFinal.length; i++) {
+      for (let j = i + 1; j < movingFinal.length; j++) {
+        resolveMovingCollision(movingFinal[i], movingFinal[j], s.exitOpen, params.minSpeed);
+      }
+    }
+  }
+
+  // Open exit?
+  if (!s.exitOpen && s.allBallsEntered) {
+    const elapsed = s.phaseTimer - params.entryDuration;
+    if (elapsed >= 0 && (isTopSurfaceCovered(s) || elapsed >= 20000)) {
+      s.exitOpen = true;
+    }
+  }
+
+  // Phase complete?
+  if (s.exitOpen && s.allBallsEntered &&
+      s.movingBalls.filter(b => !b.immobile).length === 0) {
+    const newLayer = s.movingBalls.filter(b => b.immobile);
+    if (newLayer.length > 0) s.immobilizedLayers.push(newLayer);
+    s.movingBalls = [];
+
+    // Check if screen full
+    const allImm = getAllImmobile(s);
+    const topY = allImm.length > 0 ? Math.min(...allImm.map(b => b.y - b.r)) : H;
+    if (topY <= BALL_R * 3) {
+      s.status = 'done';
+      setTimeout(resetSim, 1500);
+      return;
+    }
+
+    s.phase = 1 - s.phase;
+    s.status = 'idle';
+    s.idleTimer = 0;
+  }
+}
+
+// --- Draw ---
+function drawBall(x, y, r, color) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  const g = ctx.createRadialGradient(x - r*0.3, y - r*0.35, r*0.08, x, y, r);
+  if (color === '#004488') {
+    g.addColorStop(0, '#4499dd');
+    g.addColorStop(0.5, '#004488');
+    g.addColorStop(1, '#001122');
+  } else {
+    g.addColorStop(0, '#ee8899');
+    g.addColorStop(0.5, '#BB5566');
+    g.addColorStop(1, '#441122');
+  }
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(x - r*0.28, y - r*0.32, r*0.2, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.fill();
+}
+
+function draw(s) {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0d0d1a';
+  ctx.fillRect(0, 0, W, H);
+  for (const b of s.baseLayer) drawBall(b.x, b.y, b.r, b.color);
+  for (const layer of s.immobilizedLayers)
+    for (const b of layer) drawBall(b.x, b.y, b.r, b.color);
+  for (const b of s.movingBalls) drawBall(b.x, b.y, b.r, b.color);
+}
+
+// --- Loop ---
+function loop(timestamp) {
+  if (!lastTime) lastTime = timestamp;
+  const dt = Math.min(timestamp - lastTime, 33);
+  lastTime = timestamp;
+  update(dt);
+  draw(simState);
+  requestAnimationFrame(loop);
+}
+
+document.getElementById('restartBtn').addEventListener('click', () => {
+  resetSim();
+  lastTime = null;
+});
+
+resetSim();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
