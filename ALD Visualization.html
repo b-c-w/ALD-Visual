@@ -65,7 +65,12 @@
 </style>
 </head>
 <body>
+
+<!-- The canvas is where all particle physics and drawing happens -->
 <canvas id="sim"></canvas>
+
+<!-- UI controls panel — all values are read live each frame so changes
+     take effect immediately without needing a restart -->
 <div class="controls">
   <div class="control-row">
     <label>Max speed (px/s)</label>
@@ -111,22 +116,42 @@
 </div>
 
 <script>
+// ============================================================
+// CANVAS SETUP
+// ============================================================
 const canvas = document.getElementById('sim');
 const ctx = canvas.getContext('2d');
 
+// Simulation window: 4 inches wide by 3 inches tall at 96 DPI
 const DPI = 96;
-const W = 4 * DPI;
-const H = 3 * DPI;
+const W = 4 * DPI;  // 384px wide
+const H = 3 * DPI;  // 288px tall
 canvas.width = W;
 canvas.height = H;
 
+// Ball radius: fit exactly 30 balls across the width
 const BALL_R = W / 60;
 const DIAMETER = BALL_R * 2;
+
+// How many pixels a newly stuck ball overlaps into the ball it adhered to.
+// A small overlap makes the layers look naturally packed rather than just touching.
 const OVERLAP_STICK = 2;
+
+// Number of physics sub-steps per animation frame.
+// Splitting each frame into smaller steps prevents fast balls from tunneling
+// through thin collision boundaries in a single frame.
 const SUBSTEPS = 3;
 
+
+// ============================================================
+// UTILITY
+// ============================================================
+
+// Returns a random float between a and b
 function rand(a, b) { return a + Math.random() * (b - a); }
 
+// Reads all UI input values and returns them as a single params object.
+// Called every frame so live edits to controls take effect immediately.
 function getParams() {
   return {
     maxSpeed:      parseFloat(document.getElementById('maxSpeed').value)      || 768,
@@ -140,47 +165,65 @@ function getParams() {
   };
 }
 
-// --- Sim state ---
+
+// ============================================================
+// SIMULATION STATE
+// ============================================================
+
+// simState holds everything needed to describe the current state of the simulation.
+// Keeping it in one object makes it easy to reset by just replacing the object.
 let simState;
+
+// Timestamp of the previous animation frame, used to compute dt (delta time)
 let lastTime = null;
 
+
+// ============================================================
+// LAYER & BALL CREATION
+// ============================================================
+
+// Creates the initial row of 30 evenly spaced blue balls along the bottom edge.
+// These represent the substrate surface and never move.
 function createBaseLayer() {
   const layer = [];
   const count = 30;
   const spacing = W / count;
   for (let i = 0; i < count; i++) {
     layer.push({
-      x: spacing * (i + 0.5),
-      y: H - BALL_R,
+      x: spacing * (i + 0.5),  // evenly spaced across full width
+      y: H - BALL_R,            // sitting on the bottom edge
       r: BALL_R,
       color: '#004488',
       immobile: true,
-      id: Math.random()
+      id: Math.random()         // unique ID used for collision contact tracking
     });
   }
   return layer;
 }
 
+// Resets the entire simulation back to its initial state.
+// Called on page load and when the restart button is pressed.
 function resetSim() {
   simState = {
-    status: 'idle',
-    idleTimer: 0,
-    phase: 0,
-    movingBalls: [],
-    immobilizedLayers: [],
+    status: 'idle',           // 'idle' | 'running' | 'done'
+    idleTimer: 0,             // ms elapsed during the inter-phase pause
+    phase: 0,                 // 0 = red balls entering, 1 = blue balls entering
+    movingBalls: [],          // all balls currently in motion (or newly stuck this phase)
+    immobilizedLayers: [],    // array of completed layers, each an array of ball objects
     baseLayer: createBaseLayer(),
-    exitOpen: false,
-    phaseTimer: 0,
-    allBallsEntered: false,
-    entrySchedule: [],
-    entryIndex: 0,
-    floorY: H - BALL_R * 2,  // hard floor: top of base layer
+    exitOpen: false,          // when true, right wall opens and balls can leave
+    phaseTimer: 0,            // ms elapsed since current phase started
+    allBallsEntered: false,   // true once all scheduled balls have been spawned
+    entrySchedule: [],        // pre-computed list of { t, x, y, vx, vy, color } spawn events
+    entryIndex: 0,            // index into entrySchedule of next ball to spawn
+    floorY: H - BALL_R * 2,  // hard vertical floor: balls cannot go below this Y
   };
 }
 
+// Computes the hard floor Y for the current phase.
+// The floor is set to the average Y of the most recently completed immobile layer
+// minus one ball radius, so moving balls cannot sink into or below that layer.
 function getFloorY(s) {
-  // The hard floor is the average Y of the top surface of the most recent immobile layer
-  // minus one diameter (so balls can't sink below the top of that layer)
   const topLayer = s.immobilizedLayers.length > 0
     ? s.immobilizedLayers[s.immobilizedLayers.length - 1]
     : s.baseLayer;
@@ -188,14 +231,22 @@ function getFloorY(s) {
   return avgY - BALL_R;
 }
 
+// Returns a flat array of every immobile ball in the scene, including:
+// - the permanent base layer
+// - all previously completed layers
+// - any balls that have stuck during the current phase
+// This combined list is used for collision detection each substep.
 function getAllImmobile(s) {
   let arr = [...s.baseLayer];
   for (const layer of s.immobilizedLayers) arr = arr.concat(layer);
-  // Also include newly stuck balls from current phase
   arr = arr.concat(s.movingBalls.filter(b => b.immobile));
   return arr;
 }
 
+// Pre-computes the spawn schedule for all balls entering this phase.
+// Each entry records the time (ms) at which the ball should appear,
+// its Y position along the left edge, and its initial velocity vector.
+// The schedule is sorted by time so we can step through it efficiently.
 function scheduleEntries(params, phase) {
   const color = phase === 0 ? '#BB5566' : '#004488';
   const schedule = [];
@@ -207,8 +258,8 @@ function scheduleEntries(params, phase) {
     const speed = rand(params.minSpeed, params.maxSpeed);
     schedule.push({
       t, y,
-      vx: speed * Math.cos(angleRad),
-      vy: -speed * Math.sin(angleRad),
+      vx: speed * Math.cos(angleRad),  // always positive (rightward) on entry
+      vy: -speed * Math.sin(angleRad), // negative = upward in canvas coordinates
       color
     });
   }
@@ -216,6 +267,8 @@ function scheduleEntries(params, phase) {
   return schedule;
 }
 
+// Initializes a new phase: clears moving balls, resets timers,
+// computes the floor, and builds the entry schedule.
 function startPhase() {
   const params = getParams();
   simState.movingBalls = [];
@@ -228,7 +281,13 @@ function startPhase() {
   simState.status = 'running';
 }
 
-// --- Velocity helpers ---
+
+// ============================================================
+// VELOCITY HELPERS
+// ============================================================
+
+// Ensures a ball's speed never drops below minSpeed after a collision.
+// If the ball has somehow stopped entirely, send it rightward at minSpeed.
 function enforceMinSpeed(ball, minSpeed) {
   const spd = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
   if (spd < minSpeed && spd > 0) {
@@ -241,6 +300,10 @@ function enforceMinSpeed(ball, minSpeed) {
   }
 }
 
+// After the exit opens, bias all post-collision velocities so vx is positive (rightward).
+// This funnels balls toward the open right edge without teleporting them.
+// The vy sign is preserved so motion still looks natural.
+// Speed is boosted to at least minSpeed.
 function biasTowardRight(ball, minSpeed) {
   const spd = Math.max(Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy), minSpeed);
   ball.vx = Math.abs(ball.vx) < 0.01 ? spd * 0.3 : Math.abs(ball.vx);
@@ -249,7 +312,14 @@ function biasTowardRight(ball, minSpeed) {
   ball.vy = (ball.vy / len) * spd;
 }
 
-// --- Collision: moving vs immobile ---
+
+// ============================================================
+// COLLISION RESOLUTION
+// ============================================================
+
+// Reflects a moving ball off an immobile ball using the collision normal.
+// After reflection, enforces minimum speed or rightward bias depending on
+// whether the exit is currently open.
 function reflectOffImmobile(ball, imm, exitOpen, minSpeed) {
   const dx = ball.x - imm.x;
   const dy = ball.y - imm.y;
@@ -258,16 +328,20 @@ function reflectOffImmobile(ball, imm, exitOpen, minSpeed) {
   const nx = dx / dist;
   const ny = dy / dist;
   const dot = ball.vx * nx + ball.vy * ny;
-  if (dot >= 0) return; // already separating
+  if (dot >= 0) return; // balls are already separating — no reflection needed
+  // Reflect velocity about the collision normal
   ball.vx -= 2 * dot * nx;
   ball.vy -= 2 * dot * ny;
+  // Push ball out of overlap so it doesn't get stuck inside the immobile ball
   const overlap = (ball.r + imm.r) - dist;
   if (overlap > 0) { ball.x += nx * overlap; ball.y += ny * overlap; }
   if (exitOpen) biasTowardRight(ball, minSpeed);
   else enforceMinSpeed(ball, minSpeed);
 }
 
-// --- Collision: moving vs moving ---
+// Resolves a collision between two moving balls using equal-mass elastic collision.
+// Separates overlapping balls, exchanges momentum along the collision normal,
+// then enforces minimum speed or rightward bias.
 function resolveMovingCollision(a, b, exitOpen, minSpeed) {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
@@ -276,13 +350,15 @@ function resolveMovingCollision(a, b, exitOpen, minSpeed) {
   if (dist >= minDist || dist === 0) return;
   const nx = dx / dist;
   const ny = dy / dist;
+  // Push apart so they no longer overlap
   const overlap = (minDist - dist) / 2;
   a.x -= nx * overlap; a.y -= ny * overlap;
   b.x += nx * overlap; b.y += ny * overlap;
+  // Exchange momentum along the collision normal (equal mass elastic collision)
   const dvx = a.vx - b.vx;
   const dvy = a.vy - b.vy;
   const dot = dvx * nx + dvy * ny;
-  if (dot <= 0) return;
+  if (dot <= 0) return; // already separating
   a.vx -= dot * nx; a.vy -= dot * ny;
   b.vx += dot * nx; b.vy += dot * ny;
   if (exitOpen) {
@@ -294,20 +370,26 @@ function resolveMovingCollision(a, b, exitOpen, minSpeed) {
   }
 }
 
-// --- Wall bounce ---
+// Handles bouncing off the four canvas walls.
+// The right wall only bounces when the exit is closed.
+// The floor is enforced as a hard boundary at floorY (top of the last immobile layer).
+// After any wall bounce, speed and direction are corrected.
 function wallBounce(ball, exitOpen, minSpeed, floorY) {
   let bounced = false;
   if (ball.y - ball.r < 0) {
+    // Top wall
     ball.y = ball.r; ball.vy = Math.abs(ball.vy); bounced = true;
   }
-  // Hard floor: can't go below top surface of prior layer
   if (ball.y > floorY) {
+    // Hard floor: top surface of the most recent immobile layer
     ball.y = floorY; ball.vy = -Math.abs(ball.vy); bounced = true;
   }
   if (ball.x - ball.r < 0) {
+    // Left wall
     ball.x = ball.r; ball.vx = Math.abs(ball.vx); bounced = true;
   }
   if (!exitOpen && ball.x + ball.r > W) {
+    // Right wall (only active when exit is closed)
     ball.x = W - ball.r; ball.vx = -Math.abs(ball.vx); bounced = true;
   }
   if (bounced) {
@@ -316,22 +398,41 @@ function wallBounce(ball, exitOpen, minSpeed, floorY) {
   }
 }
 
-// --- Stick position check ---
-// Returns true if the proposed stick position is clear of all existing immobile balls
+
+// ============================================================
+// STICKING LOGIC
+// ============================================================
+
+// Before allowing a ball to adsorb (stick), checks that its proposed
+// resting position doesn't overlap any existing immobile ball.
+// This prevents multiple balls from stacking on top of each other
+// at the same location — only one ball can occupy a given spot.
+// Returns true if the position is clear, false if it's already occupied.
 function stickPositionClear(px, py, allImmobile, excludeId) {
   for (const imm of allImmobile) {
     if (imm.id === excludeId) continue;
     const dx = px - imm.x;
     const dy = py - imm.y;
-    const distSq = dx*dx + dy*dy;
-    // Require center-to-center distance >= 2*r - OVERLAP_STICK to prevent overlap
+    const distSq = dx * dx + dy * dy;
+    // Minimum allowed center-to-center distance accounts for the intentional overlap
     const minDist = DIAMETER - OVERLAP_STICK;
     if (distSq < minDist * minDist) return false;
   }
   return true;
 }
 
-// --- Layer coverage check ---
+
+// ============================================================
+// LAYER COMPLETION CHECK
+// ============================================================
+
+// Determines whether the top surface of the most recently completed immobile
+// layer has been fully covered by newly stuck balls this phase.
+// Coverage means:
+//   - The leftmost stuck ball reaches the left edge of the layer below
+//   - The rightmost stuck ball reaches the right edge of the layer below
+//   - No gap between adjacent stuck balls exceeds 105% of one ball diameter
+// Returns true when all conditions are met.
 function isTopSurfaceCovered(s) {
   const newlyImmobile = s.movingBalls.filter(b => b.immobile);
   if (newlyImmobile.length === 0) return false;
@@ -351,11 +452,16 @@ function isTopSurfaceCovered(s) {
   return true;
 }
 
-// --- Update ---
+
+// ============================================================
+// MAIN UPDATE LOOP
+// ============================================================
+
 function update(dt) {
   const s = simState;
   const params = getParams();
 
+  // --- Idle state: waiting between phases ---
   if (s.status === 'idle') {
     s.idleTimer += dt;
     if (s.idleTimer >= 1500) { s.idleTimer = 0; startPhase(); }
@@ -365,33 +471,45 @@ function update(dt) {
 
   s.phaseTimer += dt;
 
-  // Spawn balls
+  // --- Spawn balls from the entry schedule ---
+  // Balls are pre-scheduled with random entry times within the entry duration window.
+  // Each frame we check if any scheduled balls are due to appear.
   if (!s.allBallsEntered) {
     while (s.entryIndex < s.entrySchedule.length &&
            s.phaseTimer >= s.entrySchedule[s.entryIndex].t) {
       const e = s.entrySchedule[s.entryIndex++];
       s.movingBalls.push({
-        x: -BALL_R, y: e.y,
+        x: -BALL_R,           // spawn just off the left edge so ball appears to enter fully
+        y: e.y,
         r: BALL_R,
-        vx: Math.abs(e.vx),
+        vx: Math.abs(e.vx),  // ensure initial direction is rightward
         vy: e.vy,
         color: e.color,
         immobile: false,
         id: Math.random(),
+        // contactedIds tracks which immobile balls this ball is currently touching.
+        // The stick/bounce decision is only made at the MOMENT of first contact,
+        // not on every subsequent frame of overlap — this prevents a ball from
+        // rolling the dice repeatedly while it sits against an immobile ball.
         contactedIds: new Set()
       });
     }
     if (s.entryIndex >= s.entrySchedule.length) s.allBallsEntered = true;
   }
 
+  // The color that moving balls will stick to (opposite of current phase color)
   const oppositeColor = s.phase === 0 ? '#004488' : '#BB5566';
   const subDt = dt / SUBSTEPS;
 
+  // --- Physics substeps ---
+  // Running multiple substeps per frame reduces tunneling for fast balls
   for (let step = 0; step < SUBSTEPS; step++) {
+
+    // Rebuild immobile list each substep so newly stuck balls are included immediately
     const allImmobile = getAllImmobile(s);
     const moving = s.movingBalls.filter(b => !b.immobile);
 
-    // Move
+    // Move all non-immobile balls forward by one substep
     const subDtSec = subDt / 1000;
     for (const ball of moving) {
       ball.x += ball.vx * subDtSec;
@@ -399,7 +517,7 @@ function update(dt) {
       wallBounce(ball, s.exitOpen, params.minSpeed, s.floorY);
     }
 
-    // Remove exited
+    // Remove balls that have fully crossed the right edge (exit open only)
     if (s.exitOpen) {
       for (let i = s.movingBalls.length - 1; i >= 0; i--) {
         if (!s.movingBalls[i].immobile && s.movingBalls[i].x - BALL_R > W) {
@@ -408,61 +526,70 @@ function update(dt) {
       }
     }
 
-    // Moving vs immobile
+    // --- Moving ball vs immobile ball collisions ---
     const movingNow = s.movingBalls.filter(b => !b.immobile);
     for (const ball of movingNow) {
       for (const imm of allImmobile) {
         const dx = ball.x - imm.x;
         const dy = ball.y - imm.y;
-        const dist = Math.sqrt(dx*dx + dy*dy);
+        const dist = Math.sqrt(dx * dx + dy * dy);
         const minDist = ball.r + imm.r;
 
         if (dist < minDist) {
           const key = imm.id;
+
           if (!ball.contactedIds.has(key)) {
+            // First contact with this immobile ball this collision event
             ball.contactedIds.add(key);
 
-            // Attempt to stick?
             const canStick = imm.color === oppositeColor && !s.exitOpen;
             if (canStick && Math.random() < params.stickProb) {
-              // Compute proposed stick position
+              // Ball wants to adsorb — compute proposed stick position
+              // The ball overlaps the immobile ball by OVERLAP_STICK pixels
+              // to make layers look naturally packed
               const nx = dist > 0 ? dx/dist : 1;
               const ny = dist > 0 ? dy/dist : 0;
               const px = imm.x + nx * (minDist - OVERLAP_STICK);
               const py = imm.y + ny * (minDist - OVERLAP_STICK);
 
-              // Only stick if position is clear
               if (stickPositionClear(px, py, allImmobile, ball.id)) {
+                // Position is free — adsorb here
                 ball.immobile = true;
                 ball.vx = 0; ball.vy = 0;
                 ball.x = px; ball.y = py;
               } else {
-                // Position occupied — bounce instead
+                // Position already occupied by another ball — bounce instead
                 reflectOffImmobile(ball, imm, s.exitOpen, params.minSpeed);
               }
             } else {
+              // Either same color, exit is open, or lost the stick roll — bounce
               reflectOffImmobile(ball, imm, s.exitOpen, params.minSpeed);
             }
+
           } else {
-            // Re-contact: push out
+            // Continued overlap with a ball already in contactedIds.
+            // Just push out and correct velocity direction — no new stick roll.
             if (dist > 0) {
               const nx = dx/dist;
               const ny = dy/dist;
               ball.x += nx * (minDist - dist);
               ball.y += ny * (minDist - dist);
-              const dot = ball.vx*nx + ball.vy*ny;
+              const dot = ball.vx * nx + ball.vy * ny;
               if (dot < 0) { ball.vx -= 2*dot*nx; ball.vy -= 2*dot*ny; }
             }
             if (s.exitOpen) biasTowardRight(ball, params.minSpeed);
             else enforceMinSpeed(ball, params.minSpeed);
           }
+
         } else {
+          // Ball has moved away from this immobile ball — clear contact record
+          // so the next approach will be treated as a fresh first contact
           ball.contactedIds.delete(imm.id);
         }
       }
     }
 
-    // Moving vs moving
+    // --- Moving ball vs moving ball collisions ---
     const movingFinal = s.movingBalls.filter(b => !b.immobile);
     for (let i = 0; i < movingFinal.length; i++) {
       for (let j = i + 1; j < movingFinal.length; j++) {
@@ -471,7 +598,10 @@ function update(dt) {
     }
   }
 
-  // Open exit?
+  // --- Check whether to open the right-wall exit ---
+  // Exit opens when all balls have entered AND either:
+  //   (a) the top surface of the prior layer is fully covered, or
+  //   (b) 20 seconds have elapsed since the last ball entered (timeout)
   if (!s.exitOpen && s.allBallsEntered) {
     const elapsed = s.phaseTimer - params.entryDuration;
     if (elapsed >= 0 && (isTopSurfaceCovered(s) || elapsed >= 20000)) {
@@ -479,14 +609,17 @@ function update(dt) {
     }
   }
 
-  // Phase complete?
+  // --- Check whether the current phase is complete ---
+  // Phase ends when exit is open, all balls have entered, and no moving balls remain
   if (s.exitOpen && s.allBallsEntered &&
       s.movingBalls.filter(b => !b.immobile).length === 0) {
+
+    // Promote the newly stuck balls to a permanent completed layer
     const newLayer = s.movingBalls.filter(b => b.immobile);
     if (newLayer.length > 0) s.immobilizedLayers.push(newLayer);
     s.movingBalls = [];
 
-    // Check if screen full
+    // Check if the stack has reached the top of the canvas — if so, restart
     const allImm = getAllImmobile(s);
     const topY = allImm.length > 0 ? Math.min(...allImm.map(b => b.y - b.r)) : H;
     if (topY <= BALL_R * 3) {
@@ -495,45 +628,75 @@ function update(dt) {
       return;
     }
 
+    // Alternate between red phase (0) and blue phase (1) and begin idle pause
     s.phase = 1 - s.phase;
     s.status = 'idle';
     s.idleTimer = 0;
   }
 }
 
-// --- Draw ---
+
+// ============================================================
+// RENDERING
+// ============================================================
+
+// Draws a single ball with a radial gradient and a small specular highlight.
+// The gradient gives a subtle 3D sphere appearance.
+// Gradients are created per-call; for 150-300 balls this is fast enough.
 function drawBall(x, y, r, color) {
+  // Main body gradient: light spot offset toward upper-left, dark edge
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
   const g = ctx.createRadialGradient(x - r*0.3, y - r*0.35, r*0.08, x, y, r);
   if (color === '#004488') {
+    // Blue ball
     g.addColorStop(0, '#4499dd');
     g.addColorStop(0.5, '#004488');
     g.addColorStop(1, '#001122');
   } else {
+    // Red ball
     g.addColorStop(0, '#ee8899');
     g.addColorStop(0.5, '#BB5566');
     g.addColorStop(1, '#441122');
   }
   ctx.fillStyle = g;
   ctx.fill();
+
+  // Small white specular highlight in the upper-left quadrant
   ctx.beginPath();
   ctx.arc(x - r*0.28, y - r*0.32, r*0.2, 0, Math.PI*2);
   ctx.fillStyle = 'rgba(255,255,255,0.18)';
   ctx.fill();
 }
 
+// Clears the canvas and redraws all balls in layer order:
+// base layer → completed immobile layers → current phase balls (moving + newly stuck)
+// Drawing in this order ensures newer balls appear in front of older ones.
 function draw(s) {
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = '#0d0d1a';
   ctx.fillRect(0, 0, W, H);
+
+  // Permanent substrate layer (always blue)
   for (const b of s.baseLayer) drawBall(b.x, b.y, b.r, b.color);
+
+  // All previously completed alternating layers
   for (const layer of s.immobilizedLayers)
     for (const b of layer) drawBall(b.x, b.y, b.r, b.color);
+
+  // Current phase: both moving balls and any that have just stuck
+  // These are drawn last so they appear on top (correct z-order)
   for (const b of s.movingBalls) drawBall(b.x, b.y, b.r, b.color);
 }
 
-// --- Loop ---
+
+// ============================================================
+// ANIMATION LOOP
+// ============================================================
+
+// Main requestAnimationFrame loop.
+// dt is capped at 33ms (~30fps minimum) to prevent large physics jumps
+// if the tab loses focus or the browser throttles rendering.
 function loop(timestamp) {
   if (!lastTime) lastTime = timestamp;
   const dt = Math.min(timestamp - lastTime, 33);
@@ -542,6 +705,11 @@ function loop(timestamp) {
   draw(simState);
   requestAnimationFrame(loop);
 }
+
+
+// ============================================================
+// INIT
+// ============================================================
 
 document.getElementById('restartBtn').addEventListener('click', () => {
   resetSim();
